@@ -1,93 +1,100 @@
-"""
-GENERALIZATION NOTE:
-Yeh scoring agent sirf resumes tak limited nahi hai.
-Isi function ka structure kisi bhi text-based document
-(jaise: product description, cover letter, business proposal,
-job posting, essay, etc.) ko score karne ke liye reuse kiya
-ja sakta hai — bas prompt (upar wala instruction jo Gemini ko
-bhejte hain) change karna hoga according to use-case.
-
-Example: agar "resume" ko "product description" se replace
-karke prompt mein criteria badal do (jaise clarity, USP,
-target audience), toh yehi agent product descriptions bhi
-score kar dega. Core logic (extract -> score -> structured
-JSON output) same rahega.
-"""
-
-import os
 import json
-import google.generativeai as genai
-from dotenv import load_dotenv
-
-# Load API key from .env
-load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=api_key, transport="rest")
-model = genai.GenerativeModel("gemini-3.8-flash")
+import os
 import time
+from dotenv import load_dotenv
+import google.generativeai as genai
 from google.api_core.exceptions import ResourceExhausted
 
+load_dotenv()
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"), transport="rest")
+
+# Model configuration
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+
 def call_gemini_with_retry(model, prompt, max_retries=5, base_delay=5, **kwargs):
-    """Calls Gemini API with automatic retry on rate-limit (429) errors."""
+    """
+    Calls Gemini API with exponential backoff on rate-limit (429) errors.
+    """
     for attempt in range(1, max_retries + 1):
         try:
             response = model.generate_content(prompt, **kwargs)
             return response
-        except ResourceExhausted as e:
+        except ResourceExhausted:
             wait_time = base_delay * attempt
             print(f"⚠️ Rate limit hit (attempt {attempt}/{max_retries}). Retrying in {wait_time}s...")
             time.sleep(wait_time)
         except Exception as e:
             print(f"❌ Unexpected error: {e}")
             raise
-    raise Exception("Max retries exceeded. Gemini API is still rate-limited.")
-def score_resume(resume_text):
-    prompt = f"""
-You are an expert recruiter and resume evaluator.
+    raise Exception("Max retries exceeded. Gemini API rate-limited.")
 
-Analyze the following resume text and score it from 0 to 100 based on:
-- Clarity and structure
-- Relevant skills and experience
-- Achievements and impact
-- Overall job-readiness
+def score_resume_with_jd(resume_text, job_description="General AI / Software Engineer", max_loops=3):
+    # Model instance standard name ke sath
+    model_instance = genai.GenerativeModel('models/gemini-1.5-flash')
+    
+    prompt = f"""
+You are an expert ATS (Applicant Tracking System) recruiter and resume evaluator.
+
+Compare the following Resume against the Job Description.
+
+Job Description:
+"{job_description}"
 
 Resume Text:
-\"\"\"{resume_text}\"\"\"
+"{resume_text}"
 
-Respond ONLY in valid JSON format, with no extra text, no markdown, no explanation outside JSON.
+Respond ONLY in valid JSON format with no extra text, no markdown.
 Use exactly this structure:
 {{
-  "score": <integer 0-100>,
-  "strengths": ["point1", "point2", "..."],
-  "weaknesses": ["point1", "point2", "..."],
-  "suggestions": ["point1", "point2", "..."]
+  "match_score": 85,
+  "ats_compatibility": "High",
+  "matching_skills": ["Python", "Machine Learning"],
+  "missing_skills": ["Docker", "Kubernetes"],
+  "strengths": ["Strong background in AI", "Clear achievements"],
+  "weaknesses": ["Missing portfolio links"],
+  "recommendations": ["Add GitHub profile link", "Highlight deployment experience"]
 }}
 """
+    current_prompt = prompt
 
-    response = call_gemini_with_retry(model, prompt,request_options={"timeout": 60})
-                                        
-    raw_text = response.text.strip()
+    for loop_count in range(1, max_loops + 1):
+        try:
+            # Direct API call with error handling
+            response = call_gemini_with_retry(model_instance, current_prompt)
+            raw_text = response.text.strip()
 
-    # Clean up in case Gemini wraps it in ```json ... ```
-    if raw_text.startswith("```"):
-        raw_text = raw_text.strip("`")
-        raw_text = raw_text.replace("json", "", 1).strip()
+            if "```" in raw_text:
+                parts = raw_text.split("```")
+                raw_text = parts[1]
+                if raw_text.startswith("json"):
+                    raw_text = raw_text[4:]
+            raw_text = raw_text.strip()
 
-    try:
-        result = json.loads(raw_text)
-    except json.JSONDecodeError:
-        result = {
-            "error": "Failed to parse JSON from Gemini response",
-            "raw_response": raw_text
-        }
+            result = json.loads(raw_text)
+            return result
+        except json.JSONDecodeError as e:
+            print(f"⚠️ [Loop Guard] Parsing failed on attempt {loop_count}/{max_loops}. Self-correcting...")
+            current_prompt += f"\n\nERROR: Your response was not valid JSON ({str(e)}). Return strictly valid JSON ONLY."
+        except Exception as e:
+            # Fallback to gemini-pro if gemini-1.5-flash gives 404 on older library version
+            if "404" in str(e):
+                print("⚠️ Retrying with gemini-pro model...")
+                model_instance = genai.GenerativeModel('models/gemini-pro')
+                continue
+            raise e
 
-    return result
-
+    return {
+        "status": "failed",
+        "error": "Loop Guard Triggered: Could not parse JSON from Gemini after retries."
+    }
 
 if __name__ == "__main__":
     from extract import extract_resume_text
-
-    resume_text = extract_resume_text("sample_resume.docx.docx")
-    result = score_resume(resume_text)
-
-    print(json.dumps(result, indent=2))
+    
+    # Quick Test
+    sample_path = "sample_resume.docx.docx"
+    if os.path.exists(sample_path):
+        text = extract_resume_text(sample_path)
+        output = score_resume_with_jd(text, "Python AI Developer")
+        print(json.dumps(output, indent=2))
